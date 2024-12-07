@@ -1,87 +1,117 @@
-import streamlit as st
-import numpy as np
-from transformers import pipeline
+from fastapi import BackgroundTasks, FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+import pandas as pd
+from io import BytesIO 
+from langchain_core.prompts import SystemMessagePromptTemplate, HumanMessagePromptTemplate, ChatPromptTemplate
+from langchain.vectorstores.faiss import FAISS
+from langchain.embeddings import OpenAIEmbeddings 
 import faiss
-from PyPDF2 import PdfReader
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.text_splitter import CharacterTextSplitter
+from langchain.docstore import InMemoryDocstore
+
+import os
+from langchain.chains import ConversationalRetrievalChain  
+from langchain.memory import ConversationBufferMemory  
+from langchain.chains import RetrievalQA
+from langchain_openai import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
+import sys
+
+
+os.environ['OPENAI_API_KEY'] = #openai_api_key
  
-# Initialize Streamlit app
-st.title("PDF Question Answering System with FAISS and LangChain")
+# Initialize memory
+memory = ConversationBufferMemory(memory_key='chat_history', return_messages=True)
+  
+app = FastAPI()
  
-# Function to extract text from PDF
-def extract_text_from_pdf(pdf_file):
-    pdf_reader = PdfReader(pdf_file)
-    text = ""
-    for page in pdf_reader.pages:
-        text += page.extract_text() 
-    return text
+# Initialize FAISS vector store
+def initialize_faiss_vector_store():
+    # Step 1: Create embeddings instance
+    embeddings = OpenAIEmbeddings(api_key=#openai_api_key)
  
-# Embedder class using LangChain for embedding generation
-class Embedder:
-    def __init__(self):
-        # Use LangChain's HuggingFace embeddings wrapper
-        self.embedding_model = HuggingFaceEmbeddings(model_name='sentence-transformers/all-MiniLM-L6-v2')
+    # Step 2: Define the dimension of your embeddings
+    embedding_dimension = 1536  # Example dimension for OpenAI's models, adjust according to your model
+ 
+    # Step 3: Initialize a FAISS index with L2 distance
+    faiss_index = faiss.IndexFlatL2(embedding_dimension)
+ 
+    # Step 4: Create an InMemoryDocstore instance
+    docstore = InMemoryDocstore({})  # Empty docstore initially
+ 
+    # Step 5: Initialize the FAISS vector store using correct parameters
+    vector_store = FAISS(embedding_function=embeddings.embed_query,
+                         index=faiss_index,
+                         docstore=docstore,
+                         index_to_docstore_id={})
+ 
+    return vector_store
+ 
+# Initialize the vector store
+vector_store = initialize_faiss_vector_store()
+
+def getChatLLMChain(k):
+    llm = ChatOpenAI(model='gpt-3.5-turbo', api_key=, temperature=1)
+    retriever = vector_store.as_retriever(search_type='similarity', search_kwargs={'k': k})
     
-    def embed_text(self, texts, is_query=False):
-        if is_query:
-            # For single query embedding
-            return self.embedding_model.embed_query(texts)
-        else:
-            # For embedding documents (multiple chunks of text)
-            return self.embedding_model.embed_documents(texts)
- 
-embedder = Embedder()
- 
-# Create a FAISS index with the appropriate dimension
-dimension = 384  # The dimension for 'all-MiniLM-L6-v2' embeddings
-index = faiss.IndexFlatL2(dimension)
- 
-# Function to add text chunks to the FAISS index
-def add_texts_to_index(texts):
-    embeddings = embedder.embed_text(texts)  # Embed all texts at once
-    index.add(np.array(embeddings))
- 
-# Function to find the most relevant chunks
-def find_most_relevant_chunks(query_embedding, k=3):
-    distances, indices = index.search(np.array([query_embedding]), k)
-    return indices[0]
- 
-# Set up the question-answering chain using FAISS and Hugging Face LLM
-def answer_question(question):
-    # Embed the question using LangChain's HuggingFace model
-    question_embedding = embedder.embed_text(question, is_query=True)
+    system_template = """
+    Use the following pieces of context to answer the user's question. If you don't find the answer in the provided context, just respond "I don't have the answer. Connecting you to a support agent." in plain text
+    Context: {context}
+    """
     
-    # Find the most relevant chunk indices
-    relevant_chunk_indices = find_most_relevant_chunks(question_embedding)
+    user_template = "Question: {question}"
+    messages = [
+        SystemMessagePromptTemplate.from_template(system_template),
+        HumanMessagePromptTemplate.from_template(user_template)
+    ]
     
-    # Get the relevant text chunks
-    relevant_texts = " ".join([texts[idx] for idx in relevant_chunk_indices])
+    qa_prompt = ChatPromptTemplate.from_messages(messages)
     
-    # Initialize the Hugging Face QA pipeline
-    qa_pipeline = pipeline('question-answering', model='deepset/roberta-base-squad2')
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=retriever,
+        memory=memory,
+        chain_type='stuff',
+        combine_docs_chain_kwargs={'prompt': qa_prompt},
+        verbose=False
+    )
+    return chain
  
-    # Use the QA model to generate an answer
-    answer = qa_pipeline({'question': question, 'context': relevant_texts})
- 
+def ask_and_get_answer(vector_store, q, chain, k=3):
+    answer = chain.invoke({'question': q})
     return answer['answer']
  
-# Streamlit file uploader for PDF
-uploaded_file = st.file_uploader("Upload a PDF", type="pdf")
-if uploaded_file is not None:
-    # Extract text from the uploaded PDF
-    extracted_text = extract_text_from_pdf(uploaded_file)
+@app.post("/upload/")
+async def upload_file(file: UploadFile = File(...)):
+    if file.content_type not in ["text/csv", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"]:
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a CSV or Excel file.")
+ 
+    try:
+        if file.content_type == "text/csv":
+            df = pd.read_csv(BytesIO(await file.read()))
+        else:
+            df = pd.read_excel(BytesIO(await file.read()))
+ 
+        return JSONResponse(content={"acknowledgment": "File received and processed successfully."}, status_code=200)
     
-    # Split the extracted text into chunks (e.g., by paragraphs)
-    text_splitter = CharacterTextSplitter(separator='\n\n', chunk_size=1000, chunk_overlap=200)
-    texts = text_splitter.split_text(extracted_text)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing the file: {str(e)}")
+  
+@app.post("/chat/")
+async def chat(prompt: str):
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
     
-    # Add extracted text chunks to the FAISS index
-    add_texts_to_index(texts)
+    usermsg = prompt
+    print(usermsg)
     
-    # Display a text input for asking questions
-    question = st.text_input("Ask a question:")
+    k = 3
+    chain = getChatLLMChain(k)
+    answer = ask_and_get_answer(vector_store, prompt, chain, k)
     
-    if question:
-        answer = answer_question(question)
-        st.write("Answer:", answer)
+    translated_answer = answer
+    response = translated_answer
+    return {"response": response}
+ 
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
