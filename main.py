@@ -108,8 +108,8 @@ async def chat(prompt: str):
     chain = getChatLLMChain(k)
     answer = ask_and_get_answer(vector_store, prompt, chain, k)
     
-    translated_answer = answer
-    response = translated_answer
+    generated_answer = answer
+    response = generated_answer
     return {"response": response}
  
 if __name__ == "__main__":
